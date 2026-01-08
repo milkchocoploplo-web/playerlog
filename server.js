@@ -36,6 +36,8 @@ pool.query(`
 
 app.post('/api/log', async (req, res) => {
   const { players } = req.body;
+  console.log('Received POST request to /api/log');
+  console.log('Players data:', players);  // 受信データをログ
   if (!players || !Array.isArray(players)) {
     return res.status(400).json({ error: 'Invalid data' });
   }
