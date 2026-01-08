@@ -1,162 +1,140 @@
 const express = require('express');
-const fs = require('fs');
-const multer = require('multer');
+const { Pool } = require('pg');
+const bodyParser = require('body-parser');
+
 const app = express();
-const upload = multer({ dest: 'uploads/' });
-const PORT = process.env.PORT || 3000;
-const ADMIN_TOKEN = 'your-secret-token';  // 変更推奨、環境変数に
+const port = process.env.PORT || 3000;
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.static('public'));  // HTML/CSS用フォルダ (後述)
+app.use(bodyParser.json());
+app.use(express.static('public')); // 静的ファイル用（HTMLフォーム）
 
-// データファイル
-const DATA_FILE = 'players.json';
-if (!fs.existsSync(DATA_FILE)) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify({ players: [], blacklist: [], logs: [] }));
-}
+// PostgreSQL接続（Renderの環境変数 DATABASE_URL を使用）
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false } // RenderのPostgres用
+});
 
-// データ読み込み/保存ヘルパー
-function loadData() {
-  return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-}
+// DBテーブル作成（初回起動時）
+pool.query(`
+  CREATE TABLE IF NOT EXISTS players (
+    fc INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS logs (
+    id SERIAL PRIMARY KEY,
+    fc INTEGER,
+    old_name TEXT,
+    new_name TEXT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS blacklists (
+    fc INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+  );
+`).catch(err => console.error('Table creation error:', err));
 
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data));
-}
-
-// POST /log: プレイヤー情報受信
-app.post('/log', (req, res) => {
+// POST /api/log: プレイヤーデータ受信・処理
+app.post('/api/log', async (req, res) => {
   const { players } = req.body;
-  if (!players || !Array.isArray(players)) return res.status(400).send('Invalid data');
-
-  const data = loadData();
-  const playerMap = new Map(data.players.map(p => [p.fc, p]));
-
-  players.forEach(newPlayer => {
-    const { fc, name } = newPlayer;
-    const existing = playerMap.get(fc);
-    if (existing) {
-      if (existing.name !== name) {
-        data.logs.push(`${fc}: ${existing.name} → ${name}`);
-        existing.name = name;
-      }
-      // 一致時は何もしない
-    } else {
-      data.players.push({ fc, name });
-    }
-  });
-
-  // ソート: FC昇順
-  data.players.sort((a, b) => a.fc - b.fc);
-
-  saveData(data);
-  res.send('Logged');
-});
-
-// GET /log: ログ表示 (HTML)
-app.get('/', (req, res) => {
-  const data = loadData();
-
-  // ブラックリストを一番上に
-  let html = '<h1>Player Logs</h1><ul>';
-  data.blacklist.forEach(bl => {
-    const gamePlayer = data.players.find(p => p.fc === bl.fc);
-    const gameName = gamePlayer ? gamePlayer.name : 'Unknown';
-    html += `<li><strong>Blacklist:</strong> ${bl.fc} (${bl.name}): ${gameName}</li>`;
-  });
-
-  // 他のプレイヤー (FC昇順)
-  data.players.forEach(p => {
-    if (!data.blacklist.some(bl => bl.fc === p.fc)) {
-      html += `<li>${p.fc}: ${p.name}</li>`;
-    }
-  });
-
-  // 変更ログ
-  html += '</ul><h2>Change Logs</h2><ul>';
-  data.logs.forEach(log => {
-    html += `<li>${log}</li>`;
-  });
-  html += '</ul><button onclick="downloadLog()">Download Log</button>';
-  html += '<form action="/upload" method="post" enctype="multipart/form-data"><input type="file" name="logFile"><button type="submit">Upload Log</button></form>';
-
-  res.send(`
-    <html>
-    <head><title>Player Log</title><script>function downloadLog(){window.location.href='/download';}</script></head>
-    <body>${html}</body>
-    </html>
-  `);
-});
-
-// POST /blacklist: ブラックリスト追加 (Adminのみ)
-app.post('/blacklist', (req, res) => {
-  if (req.query.token !== ADMIN_TOKEN) return res.status(403).send('Unauthorized');
-
-  const { fc, name } = req.body;
-  if (!fc || !name) return res.status(400).send('Invalid data');
-
-  const data = loadData();
-  if (!data.blacklist.some(bl => bl.fc === parseInt(fc))) {
-    data.blacklist.push({ fc: parseInt(fc), name });
-    saveData(data);
+  if (!players || !Array.isArray(players)) {
+    return res.status(400).json({ error: 'Invalid data' });
   }
-  res.send('Blacklist added');
-});
 
-// GET /admin: ブラックリスト入力フォーム
-app.get('/admin', (req, res) => {
-  if (req.query.token !== ADMIN_TOKEN) return res.status(403).send('Unauthorized');
-  res.send(`
-    <html>
-    <body>
-      <h1>Add Blacklist</h1>
-      <form action="/blacklist?token=${ADMIN_TOKEN}" method="post">
-        FC: <input type="number" name="fc"><br>
-        Name: <input type="text" name="name"><br>
-        <button type="submit">Add</button>
-      </form>
-    </body>
-    </html>
-  `);
-});
+  try {
+    for (const player of players) {
+      const { fc, name } = player;
+      if (!fc || !name) continue;
 
-// GET /download: ログダウンロード
-app.get('/download', (req, res) => {
-  const data = loadData();
-  res.json(data);  // JSONとしてダウンロード
-});
-
-// POST /upload: ログアップロード・マージ
-app.post('/upload', upload.single('logFile'), (req, res) => {
-  if (!req.file) return res.status(400).send('No file uploaded');
-
-  const uploadedData = JSON.parse(fs.readFileSync(req.file.path, 'utf8'));
-  fs.unlinkSync(req.file.path);  // .temp削除
-
-  const data = loadData();
-
-  // マージ: players上書き/追加、logs追加、blacklist上書き
-  uploadedData.players.forEach(up => {
-    const idx = data.players.findIndex(p => p.fc === up.fc);
-    if (idx !== -1) {
-      if (data.players[idx].name !== up.name) {
-        data.logs.push(`${up.fc}: ${data.players[idx].name} → ${up.name}`);
+      // 既存チェック
+      const existing = await pool.query('SELECT name FROM players WHERE fc = $1', [fc]);
+      if (existing.rows.length > 0) {
+        const oldName = existing.rows[0].name;
+        if (oldName !== name) {
+          // 名前変更ログ追加
+          await pool.query('INSERT INTO logs (fc, old_name, new_name) VALUES ($1, $2, $3)', [fc, oldName, name]);
+          // 更新
+          await pool.query('UPDATE players SET name = $1, last_updated = CURRENT_TIMESTAMP WHERE fc = $2', [name, fc]);
+        }
+      } else {
+        // 新規追加
+        await pool.query('INSERT INTO players (fc, name) VALUES ($1, $2)', [fc, name]);
       }
-      data.players[idx] = up;
-    } else {
-      data.players.push(up);
     }
-  });
-
-  data.logs = [...new Set([...data.logs, ...uploadedData.logs])];  // 重複除去
-  data.blacklist = uploadedData.blacklist || data.blacklist;  // 上書き
-
-  // ソート
-  data.players.sort((a, b) => a.fc - b.fc);
-
-  saveData(data);
-  res.send('Uploaded and merged');
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// GET /: リスト表示（HTML）
+app.get('/', async (req, res) => {
+  try {
+    // ブラックリスト取得
+    const blacklists = await pool.query('SELECT * FROM blacklists ORDER BY fc ASC');
+    // 通常プレイヤー取得（FC昇順）
+    const players = await pool.query('SELECT * FROM players ORDER BY fc ASC');
+    // ログ取得（最新順）
+    const logs = await pool.query('SELECT * FROM logs ORDER BY timestamp DESC');
+
+    let html = `
+      <html>
+        <head><title>Player Log</title><style>body{font-family:sans-serif;} ul{list-style:none;} .blacklist{color:red;}</style></head>
+        <body>
+          <h1>Player List</h1>
+          <h2>Blacklists</h2>
+          <ul>`;
+    blacklists.rows.forEach(bl => {
+      // ゲーム内名前を探す
+      const gamePlayer = players.rows.find(p => p.fc === bl.fc);
+      const gameName = gamePlayer ? gamePlayer.name : 'Unknown';
+      html += `<li class="blacklist">(${bl.fc}, ${bl.name}): (${gameName})</li>`;
+    });
+    html += `</ul>
+          <h2>Players (sorted by FC)</h2>
+          <ul>`;
+    players.rows.forEach(p => {
+      html += `<li>${p.fc}: ${p.name}</li>`;
+    });
+    html += `</ul>
+          <h2>Change Logs</h2>
+          <ul>`;
+    logs.rows.forEach(log => {
+      html += `<li>${log.fc}: ${log.old_name} → ${log.new_name} (${log.timestamp})</li>`;
+    });
+    html += `</ul>
+          <h2>Add Blacklist</h2>
+          <form action="/blacklist" method="POST">
+            FC: <input type="number" name="fc" required>
+            Name: <input type="text" name="name" required>
+            <button type="submit">Add</button>
+          </form>
+        </body>
+      </html>`;
+    res.send(html);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Server error');
+  }
+});
+
+// POST /blacklist: ブラックリスト追加（フォームから）
+app.post('/blacklist', bodyParser.urlencoded({ extended: true }), async (req, res) => {
+  const { fc, name } = req.body;
+  if (!fc || !name) {
+    return res.status(400).send('Invalid input');
+  }
+
+  try {
+    await pool.query('INSERT INTO blacklists (fc, name) VALUES ($1, $2) ON CONFLICT (fc) DO UPDATE SET name = $2', [fc, name]);
+    res.redirect('/');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Server error');
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
