@@ -34,30 +34,23 @@ pool.query(`
   );
 `).catch(err => console.error('Table creation error:', err));
 
-// POST /api/log: プレイヤーデータ受信・処理
 app.post('/api/log', async (req, res) => {
   const { players } = req.body;
   if (!players || !Array.isArray(players)) {
     return res.status(400).json({ error: 'Invalid data' });
   }
-
   try {
     for (const player of players) {
       const { fc, name } = player;
       if (!fc || !name) continue;
-
-      // 既存チェック
       const existing = await pool.query('SELECT name FROM players WHERE fc = $1', [fc]);
       if (existing.rows.length > 0) {
         const oldName = existing.rows[0].name;
         if (oldName !== name) {
-          // 名前変更ログ追加
           await pool.query('INSERT INTO logs (fc, old_name, new_name) VALUES ($1, $2, $3)', [fc, oldName, name]);
-          // 更新
           await pool.query('UPDATE players SET name = $1, last_updated = CURRENT_TIMESTAMP WHERE fc = $2', [name, fc]);
         }
       } else {
-        // 新規追加
         await pool.query('INSERT INTO players (fc, name) VALUES ($1, $2)', [fc, name]);
       }
     }
